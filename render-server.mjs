@@ -1,6 +1,8 @@
 import express from 'express';
 import puppeteer from 'puppeteer';
 import cors from 'cors';
+import { readFileSync, writeFileSync, existsSync } from 'fs';
+import { execSync } from 'child_process';
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -8,6 +10,35 @@ const port = process.env.PORT || 3000;
 // Middleware
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
+
+// Check Chrome installation on startup
+async function checkChrome() {
+  try {
+    console.log('Checking Chrome installation...');
+    
+    // Try to find Chrome executable
+    const possiblePaths = [
+      './chrome-cache/chrome/linux-*/chrome-linux*/chrome',
+      '/opt/render/project/.cache/puppeteer/chrome/linux-*/chrome-linux*/chrome',
+      '/usr/bin/google-chrome',
+      '/usr/bin/google-chrome-stable'
+    ];
+    
+    // Install Chrome if not found
+    try {
+      console.log('Installing Chrome...');
+      execSync('npx puppeteer browsers install chrome --path ./chrome-cache', { stdio: 'inherit' });
+      console.log('Chrome installation completed');
+    } catch (error) {
+      console.error('Chrome installation failed:', error.message);
+    }
+    
+    return true;
+  } catch (error) {
+    console.error('Chrome check failed:', error.message);
+    return false;
+  }
+}
 
 // Health check endpoint
 app.get('/', (req, res) => {
@@ -20,6 +51,24 @@ app.get('/', (req, res) => {
 
 app.get('/health', (req, res) => {
   res.json({ status: 'healthy', timestamp: new Date().toISOString() });
+});
+
+// Chrome installation endpoint for debugging
+app.get('/chrome-status', async (req, res) => {
+  try {
+    const browser = await puppeteer.launch({
+      headless: 'new',
+      args: ['--no-sandbox', '--disable-setuid-sandbox'],
+    });
+    await browser.close();
+    res.json({ status: 'Chrome working', timestamp: new Date().toISOString() });
+  } catch (error) {
+    res.json({ 
+      status: 'Chrome failed', 
+      error: error.message,
+      timestamp: new Date().toISOString() 
+    });
+  }
 });
 
 // Main scraping endpoint
@@ -40,7 +89,7 @@ app.post('/scrape', async (req, res) => {
   try {
     console.log(`Starting browser for ${urls.length} URLs...`);
     
-    // Launch browser with Render.com optimized settings
+    // Launch browser with all possible Chrome paths
     browser = await puppeteer.launch({
       headless: 'new',
       args: [
@@ -59,14 +108,14 @@ app.post('/scrape', async (req, res) => {
         '--disable-extensions',
         '--disable-plugins',
         '--disable-images',
-        '--disable-javascript',
         '--disable-default-apps'
       ],
-      timeout: 30000
+      timeout: 30000,
+      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined
     });
 
     // Process URLs with controlled concurrency
-    const concurrency = Math.min(options.concurrency || 2, 3); // Max 3 concurrent
+    const concurrency = Math.min(options.concurrency || 2, 3);
     const chunks = chunkArray(urls, concurrency);
     
     for (const chunk of chunks) {
@@ -77,148 +126,88 @@ app.post('/scrape', async (req, res) => {
         if (result.status === 'fulfilled') {
           results.push(result.value);
         } else {
-          console.error(`Failed to scrape ${chunk[index]}:`, result.reason?.message);
+          console.error(`Failed to scrape ${chunk[index]}:`, result.reason.message);
           results.push({
             url: chunk[index],
             success: false,
-            error: result.reason?.message || 'Unknown error',
-            data: null
+            error: result.reason.message,
+            data: {}
           });
         }
       });
-      
-      // Brief pause between chunks
-      if (chunks.indexOf(chunk) < chunks.length - 1) {
-        await new Promise(resolve => setTimeout(resolve, 500));
-      }
     }
 
-    const processingTime = Date.now() - startTime;
-    console.log(`Completed scraping in ${processingTime}ms`);
-
-    res.json({
-      success: true,
-      totalUrls: urls.length,
-      successfulScrapes: results.filter(r => r.success).length,
-      products: results,
-      processingTimeMs: processingTime,
-      processedAt: new Date().toISOString()
-    });
-
   } catch (error) {
-    console.error('Scraping error:', error);
-    res.status(500).json({
+    console.error('Browser launch failed:', error.message);
+    return res.status(500).json({
       success: false,
       error: error.message,
-      products: results,
+      products: [],
       processingTimeMs: Date.now() - startTime
     });
   } finally {
     if (browser) {
       try {
         await browser.close();
-      } catch (closeError) {
-        console.error('Error closing browser:', closeError);
+      } catch (error) {
+        console.error('Error closing browser:', error.message);
       }
     }
   }
+
+  const processingTimeMs = Date.now() - startTime;
+  console.log(`Completed scraping in ${processingTimeMs}ms`);
+
+  res.json({
+    success: true,
+    products: results,
+    processingTimeMs,
+    totalUrls: urls.length,
+    successfulUrls: results.filter(r => r.success).length
+  });
 });
 
+// Helper function to chunk array
+function chunkArray(array, size) {
+  const chunks = [];
+  for (let i = 0; i < array.length; i += size) {
+    chunks.push(array.slice(i, i + size));
+  }
+  return chunks;
+}
+
+// Helper function to scrape individual URL
 async function scrapeUrl(browser, url, options) {
   const page = await browser.newPage();
   
   try {
-    // Optimized page settings
-    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
-    await page.setViewport({ width: 1280, height: 720 });
-    
-    // Block unnecessary resources for faster loading
-    await page.setRequestInterception(true);
-    page.on('request', (req) => {
-      const resourceType = req.resourceType();
-      if (['image', 'stylesheet', 'font', 'media'].includes(resourceType)) {
-        req.abort();
-      } else {
-        req.continue();
-      }
-    });
-
     console.log(`Scraping: ${url}`);
     
-    // Navigate to page with timeout
-    const response = await page.goto(url, { 
-      waitUntil: 'domcontentloaded', 
+    await page.setUserAgent('Mozilla/5.0 (compatible; CompeteTracker/1.0)');
+    await page.goto(url, { 
+      waitUntil: 'networkidle0', 
       timeout: options.timeout || 20000 
     });
 
-    if (!response || !response.ok()) {
-      throw new Error(`HTTP ${response?.status() || 'unknown'}: ${response?.statusText() || 'Failed to load'}`);
-    }
+    const extractData = options.extractData || {};
+    const data = {};
 
-    // Wait for content if selector provided
-    if (options.waitForSelector) {
+    for (const [key, selector] of Object.entries(extractData)) {
       try {
-        await page.waitForSelector(options.waitForSelector, { timeout: 3000 });
-      } catch (e) {
-        console.warn(`Selector ${options.waitForSelector} not found on ${url}`);
+        const element = await page.$(selector);
+        if (element) {
+          data[key] = await page.evaluate(el => el.textContent.trim(), element);
+        }
+      } catch (error) {
+        console.error(`Error extracting ${key}:`, error.message);
+        data[key] = null;
       }
     }
-
-    // Extract data using provided selectors
-    const extractedData = await page.evaluate((selectors) => {
-      const data = {};
-      
-      if (!selectors) return data;
-      
-      for (const [key, selector] of Object.entries(selectors)) {
-        try {
-          if (key === 'images') {
-            const imgs = Array.from(document.querySelectorAll(selector));
-            data[key] = imgs.map(img => ({
-              src: img.src || img.dataset.src || img.getAttribute('data-src'),
-              alt: img.alt || ''
-            })).filter(img => img.src);
-          } else {
-            const element = document.querySelector(selector);
-            if (element) {
-              data[key] = element.textContent?.trim() || element.innerText?.trim() || '';
-            }
-          }
-        } catch (e) {
-          console.warn(`Error extracting ${key}:`, e.message);
-        }
-      }
-      
-      return data;
-    }, options.extractData || {});
-
-    // Try to extract Shopify product data
-    const shopifyData = await page.evaluate(() => {
-      try {
-        // Look for product JSON in scripts
-        const scripts = Array.from(document.querySelectorAll('script'));
-        for (const script of scripts) {
-          const content = script.textContent || script.innerHTML;
-          if (content.includes('"product"') && content.includes('"variants"')) {
-            const productMatch = content.match(/(?:product|Product)\s*[:=]\s*({[^}]*"variants"[^}]*})/);
-            if (productMatch) {
-              return JSON.parse(productMatch[1]);
-            }
-          }
-        }
-        return null;
-      } catch (e) {
-        return null;
-      }
-    });
 
     return {
       url,
       success: true,
-      data: {
-        ...extractedData,
-        shopifyProduct: shopifyData
-      },
+      data,
       scrapedAt: new Date().toISOString()
     };
 
@@ -228,32 +217,15 @@ async function scrapeUrl(browser, url, options) {
       url,
       success: false,
       error: error.message,
-      data: null
+      data: {}
     };
   } finally {
     await page.close();
   }
 }
 
-function chunkArray(array, size) {
-  const chunks = [];
-  for (let i = 0; i < array.length; i += size) {
-    chunks.push(array.slice(i, i + size));
-  }
-  return chunks;
-}
-
-app.listen(port, '0.0.0.0', () => {
+// Start server and check Chrome
+app.listen(port, async () => {
   console.log(`Puppeteer microservice running on port ${port}`);
-});
-
-// Graceful shutdown
-process.on('SIGTERM', () => {
-  console.log('Received SIGTERM, shutting down gracefully');
-  process.exit(0);
-});
-
-process.on('SIGINT', () => {
-  console.log('Received SIGINT, shutting down gracefully');  
-  process.exit(0);
+  await checkChrome();
 });
