@@ -4,3 +4,6 @@ services:
     env: node
     buildCommand: npm install
     startCommand: node render-server.mjs
+    envVars:
+      - key: PUPPETEER_CACHE_DIR
+        value: /opt/render/project/.chrome
